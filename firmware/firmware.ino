@@ -31,7 +31,7 @@ bool solenoidStates[numSolenoids] = { false };  // false = de-energized (LOW), t
 bool internalArmed = false;   // false => Disarmed, true => Armed
 
 // Telemetry update interval (in milliseconds)
-const unsigned long telemetryInterval = 100;
+const unsigned long telemetryInterval = 30;
 unsigned long lastTelemetryTime = 0;
 
 // Buffer for incoming commands from Serial3
@@ -128,16 +128,16 @@ void sendTelemetry() {
   // Read the battery voltage (using analogRead on BATT_SENSE_PIN)
   int adcBattery = analogRead(BATT_SENSE_PIN);
   // Assuming a 12-bit ADC (0-4095) and a 3.3V reference.
-  float batteryVoltage = (adcBattery / 4095.0) * 3.3;
+  float batteryVoltage = adcBattery/28.5;
 
   // Read the arming sense voltage (using analogRead on ARMING_SENSE_PIN)
   int adcArming = analogRead(ARMING_SENSE_PIN);
-  float armingVoltage = (adcArming / 4095.0) * 3.3;
+  float armingVoltage = adcArming/197;
 
   // Build a telemetry string.
   String telemetry = "";
   telemetry += "TS:" + String(timestamp);
-  telemetry += " | ARM:" + String(internalArmed ? "ARMED" : "DISARMED");
+  telemetry += " | ARM:" + String(internalArmed ? 1 : 0);
   telemetry += " | BATT:" + String(batteryVoltage, 2) + "V";
   telemetry += " | ARM_SENSE:" + String(armingVoltage, 2) + "V";
   telemetry += " | SOL:";
