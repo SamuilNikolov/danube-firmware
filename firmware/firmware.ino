@@ -1,179 +1,155 @@
 #include <Arduino.h>
 
 // ----- Pin Assignments -----
-// Solenoid channel pins (channels 1..16):
-const int numSolenoids = 16;
-const int solenoidPins[numSolenoids] = {
-  40, 39, 38, 37, 36, 35, 34, 33,  // Channels 1-8
-  7, 6, 5, 4, 3, 2, 1, 0           // Channels 9-16
-};
-
-// RS-485 Bus 1:
-const int RS485_1_RX = 15;      // Not used in this firmware
-const int RS485_1_TX = 14;      // Not used in this firmware
-const int RS485_1_DE = 41;      // Driver Enable (tied HIGH)
-
-// RS-485 Bus 2:
-const int RS485_2_RX = 16;      // Not used in this firmware
-const int RS485_2_TX = 17;      // Not used in this firmware
-const int RS485_2_DE = 18;      // Driver Enable (tied HIGH)
-
-// Internal arming lines:
 const int ARM_PIN    = 20;
 const int DISARM_PIN = 21;
 
-// Voltage sensing pins:
+// Solenoid channels 1..16.
+const int numSolenoids = 16;
+const int solenoidPins[numSolenoids] = {
+  40, 39, 38, 37, 36, 35, 34, 33,  // Channels 1-8
+  7,  6,  5,  4,  3,  2,  1,  0    // Channels 9-16
+};
+bool solenoidStates[numSolenoids] = { false };
+
+// Voltage sensing pins.
 const int BATT_SENSE_PIN   = 23;  // Battery voltage
 const int ARMING_SENSE_PIN = 22;  // Arming voltage sense
 
-// ----- Global State Variables -----
-bool solenoidStates[numSolenoids] = { false };  // false = de-energized (LOW), true = energized (HIGH)
-bool internalArmed = false;   // false => Disarmed, true => Armed
+// ----- Telemetry Buffer & Command Buffer -----
+#define TELEMETRY_BUFFER_SIZE 128  // Buffer size to accommodate full telemetry
+char telemetryBuffer[TELEMETRY_BUFFER_SIZE];
+int telemetryLength = 0, telemetryIndex = 0;
 
-// Telemetry update interval (in milliseconds)
-const unsigned long telemetryInterval = 30;
-unsigned long lastTelemetryTime = 0;
+String cmdBuffer;  // Accumulates incoming Serial3 command data
 
-// Buffer for incoming commands from Serial3
-String commandBuffer = "";
-
-// ----- Setup Function -----
-void setup() {
-  // Initialize Serial3 for communication with the ground station
-  Serial3.begin(115200);
-
-  // --- RS-485 Bus Setup ---
-  pinMode(RS485_1_DE, OUTPUT);
-  digitalWrite(RS485_1_DE, HIGH);  // Hold DE high permanently
-
-  pinMode(RS485_2_DE, OUTPUT);
-  digitalWrite(RS485_2_DE, HIGH);  // Hold DE high permanently
-
-  // --- Internal Arm/Disarm Setup ---
-  pinMode(ARM_PIN, OUTPUT);
-  pinMode(DISARM_PIN, OUTPUT);
-  // Default state: Disarmed (set DISARM high, ARM low)
-  digitalWrite(ARM_PIN, LOW);
-  digitalWrite(DISARM_PIN, HIGH);
-  internalArmed = false;
-
-  // --- Solenoid Pins Setup ---
+// ----- Build Telemetry -----
+// Format: "TS:<timestamp> | ARM:<state> | BATT:<voltage>V | ARM_SENSE:<voltage>V | SOL:1:ON,2:OFF,...\n"
+void buildTelemetry() {
+  unsigned long t = millis();
+  // Read analog values and convert (adjust conversion factors as needed)
+  int adcBattery = analogRead(BATT_SENSE_PIN);
+  float batteryVoltage = adcBattery / 28.5;
+  int adcArming = analogRead(ARMING_SENSE_PIN);
+  float armingVoltage = adcArming / 197.0;
+  
+  int n = snprintf(telemetryBuffer, TELEMETRY_BUFFER_SIZE,
+                   "TS:%lu | ARM:%d | BATT:%.2fV | ARM_SENSE:%.2fV | SOL:",
+                   t, digitalRead(ARM_PIN), batteryVoltage, armingVoltage);
+  
+  // Append solenoid states (channels 1 to 16)
   for (int i = 0; i < numSolenoids; i++) {
-    pinMode(solenoidPins[i], OUTPUT);
-    digitalWrite(solenoidPins[i], LOW);  // Default: de-energized
-    solenoidStates[i] = false;
+    int written = snprintf(telemetryBuffer + n, TELEMETRY_BUFFER_SIZE - n,
+                             "%d:%s%s", i + 1, solenoidStates[i] ? "ON" : "OFF",
+                             (i < numSolenoids - 1) ? "," : "");
+    n += written;
+    if(n >= TELEMETRY_BUFFER_SIZE) break;
   }
-
-  // --- Voltage Sensing Pins ---
-  pinMode(BATT_SENSE_PIN, INPUT);
-  pinMode(ARMING_SENSE_PIN, INPUT);
-
-  // (Optional) Initialize onboard Serial for debugging.
-  // Serial.begin(115200);
+  
+  // Ensure newline is appended.
+  if(n > 0 && telemetryBuffer[n-1] != '\n') {
+    if(n < TELEMETRY_BUFFER_SIZE - 1) {
+      telemetryBuffer[n++] = '\n';
+      telemetryBuffer[n] = '\0';
+    } else {
+      // No room to append, so overwrite the last character with '\n'
+      telemetryBuffer[TELEMETRY_BUFFER_SIZE - 1] = '\n';
+      n = TELEMETRY_BUFFER_SIZE;
+    }
+  }
+  
+  telemetryLength = n;
+  telemetryIndex = 0;
 }
 
-// ----- Command Processing -----
-// This function parses an individual command string and acts accordingly.
-void processCommand(String cmd) {
-  cmd.trim();  // Remove any leading/trailing whitespace
-  if (cmd.length() == 0) return;  // Ignore empty commands
-
-  // --- Process Internal Arm/Disarm Commands ---
-  // Use "a" for arm and "d" for disarm.
-  if (cmd.equalsIgnoreCase("a")) {
-    // Internal ARM: set ARM_PIN HIGH and DISARM_PIN LOW
+// ----- Process Command -----
+// Commands:
+//    "a" → arm (ARM_PIN HIGH, DISARM_PIN LOW)
+//    "d" → disarm (ARM_PIN LOW, DISARM_PIN HIGH)
+//    "s{channel}{state}" → set solenoid (channel: 1–16; state: '1' for HIGH, '0' for LOW)
+void processCommand(const String &cmd) {
+  String command = cmd;
+  command.trim();
+  if (command.length() == 0)
+    return;
+  
+  // Arm/disarm commands.
+  if (command.equalsIgnoreCase("a")) {
     digitalWrite(ARM_PIN, HIGH);
     digitalWrite(DISARM_PIN, LOW);
-    internalArmed = true;
     return;
   }
-  if (cmd.equalsIgnoreCase("d")) {
-    // Internal DISARM: set DISARM_PIN HIGH and ARM_PIN LOW
+  if (command.equalsIgnoreCase("d")) {
     digitalWrite(ARM_PIN, LOW);
     digitalWrite(DISARM_PIN, HIGH);
-    internalArmed = false;
     return;
   }
-
-  // --- Process Solenoid Actuation Commands ---
-  // Command format: s{channel}{state}
-  // Examples: "s10" means channel 1 → state 0; "s51" means channel 5 → state 1.
-  if (cmd.charAt(0) == 's' || cmd.charAt(0) == 'S') {
-    // The last character is the state ('0' or '1').
-    char stateChar = cmd.charAt(cmd.length() - 1);
-    int stateVal = (stateChar == '1') ? HIGH : LOW;
-
-    // The characters between the 's' and the final digit represent the solenoid channel number.
-    String channelStr = cmd.substring(1, cmd.length() - 1);
-    int channel = channelStr.toInt();
-
-    // Check that the channel is within bounds (channels 1 to 16).
-    if (channel >= 1 && channel <= numSolenoids) {
-      int pin = solenoidPins[channel - 1];
-      digitalWrite(pin, stateVal);
-      solenoidStates[channel - 1] = (stateVal == HIGH);
+  
+  // Solenoid actuation commands.
+  if (tolower(command.charAt(0)) == 's') {
+    if (command.length() >= 2) {
+      char stateChar = command.charAt(command.length() - 1);
+      int stateVal = (stateChar == '1') ? HIGH : LOW;
+      String channelStr = command.substring(1, command.length() - 1);
+      int channel = channelStr.toInt();
+      if (channel >= 1 && channel <= numSolenoids) {
+        digitalWrite(solenoidPins[channel - 1], stateVal);
+        solenoidStates[channel - 1] = (stateVal == HIGH);
+      }
     }
     return;
   }
-
-  // (Optional) If the command is unrecognized, you could send an error response.
-  // Serial3.println("ERROR: Unrecognized command: " + cmd);
 }
 
-// ----- Telemetry Function -----
-// This function reads the current system states and sends a telemetry line over Serial3.
-void sendTelemetry() {
-  unsigned long timestamp = millis();
-
-  // Read the battery voltage (using analogRead on BATT_SENSE_PIN)
-  int adcBattery = analogRead(BATT_SENSE_PIN);
-  // Assuming a 12-bit ADC (0-4095) and a 3.3V reference.
-  float batteryVoltage = adcBattery/28.5;
-
-  // Read the arming sense voltage (using analogRead on ARMING_SENSE_PIN)
-  int adcArming = analogRead(ARMING_SENSE_PIN);
-  float armingVoltage = adcArming/197;
-
-  // Build a telemetry string.
-  String telemetry = "";
-  telemetry += "TS:" + String(timestamp);
-  telemetry += " | ARM:" + String(internalArmed ? 1 : 0);
-  telemetry += " | BATT:" + String(batteryVoltage, 2) + "V";
-  telemetry += " | ARM_SENSE:" + String(armingVoltage, 2) + "V";
-  telemetry += " | SOL:";
-
-  // Append solenoid states in the format "channel:ON/OFF" separated by commas.
+void setup() {
+  Serial3.begin(115200);
+  
+  // Initialize arm/disarm pins.
+  pinMode(ARM_PIN, OUTPUT);
+  pinMode(DISARM_PIN, OUTPUT);
+  digitalWrite(ARM_PIN, LOW);    // Default: disarmed
+  digitalWrite(DISARM_PIN, HIGH);
+  
+  // Initialize solenoid pins.
   for (int i = 0; i < numSolenoids; i++) {
-    telemetry += String(i + 1) + (solenoidStates[i] ? ":ON" : ":OFF");
-    if (i < numSolenoids - 1) {
-      telemetry += ",";
-    }
+    pinMode(solenoidPins[i], OUTPUT);
+    digitalWrite(solenoidPins[i], LOW);
+    solenoidStates[i] = false;
   }
-
-  // Send the telemetry line over Serial3.
-  Serial3.println(telemetry);
+  
+  // Initialize voltage sensing pins.
+  pinMode(BATT_SENSE_PIN, INPUT);
+  pinMode(ARMING_SENSE_PIN, INPUT);
+  
+  // Build the first telemetry message.
+  buildTelemetry();
 }
 
-// ----- Main Loop -----
 void loop() {
-  // --- Process Incoming Commands from Serial3 ---
+  // --- Non-blocking Command Processing ---
   while (Serial3.available() > 0) {
-    char inChar = (char)Serial3.read();
-    // Look for newline or carriage return as command terminators.
-    if (inChar == '\n' || inChar == '\r') {
-      if (commandBuffer.length() > 0) {
-        processCommand(commandBuffer);
-        commandBuffer = "";
+    char c = Serial3.read();
+    if (c == '\n' || c == '\r') {
+      if (cmdBuffer.length() > 0) {
+        processCommand(cmdBuffer);
+        cmdBuffer = "";
       }
     } else {
-      commandBuffer += inChar;
+      cmdBuffer += c;
     }
   }
-
-  // --- Non-Blocking Telemetry Update ---
-  unsigned long currentMillis = millis();
-  if (currentMillis - lastTelemetryTime >= telemetryInterval) {
-    sendTelemetry();
-    lastTelemetryTime = currentMillis;
+  
+  // --- Non-blocking Telemetry Transmission ---
+  if (telemetryIndex < telemetryLength) {
+    int chunk = min(8, telemetryLength - telemetryIndex);
+    if (Serial3.availableForWrite() >= chunk) {
+      Serial3.write(telemetryBuffer + telemetryIndex, chunk);
+      telemetryIndex += chunk;
+    }
+  }
+  
+  // Once the full telemetry message is sent, build a new one.
+  if (telemetryIndex >= telemetryLength) {
+    buildTelemetry();
   }
 }
