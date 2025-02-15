@@ -84,6 +84,17 @@ void processCommand(const String &cmd) {
     digitalWrite(DISARM_PIN, HIGH);
     return;
   }
+  if (command.equalsIgnoreCase("e")) {
+    for (int i = 0; i < numSolenoids; i++) {
+    pinMode(solenoidPins[i], OUTPUT);
+    digitalWrite(solenoidPins[i], LOW);
+    solenoidStates[i] = false;
+  }
+    digitalWrite(ARM_PIN, LOW);
+    digitalWrite(DISARM_PIN, HIGH);
+    return;
+  }
+   
   
   // Solenoid actuation commands.
   if (tolower(command.charAt(0)) == 's') {
@@ -102,7 +113,7 @@ void processCommand(const String &cmd) {
 }
 
 void setup() {
-  Serial3.begin(115200);
+  Serial3.begin(2000000);
   
   // Initialize arm/disarm pins.
   pinMode(ARM_PIN, OUTPUT);
@@ -120,6 +131,8 @@ void setup() {
   // Initialize voltage sensing pins.
   pinMode(BATT_SENSE_PIN, INPUT);
   pinMode(ARMING_SENSE_PIN, INPUT);
+    pinMode(41, OUTPUT);
+    digitalWrite(41, HIGH);
   
   // Build the first telemetry message.
   buildTelemetry();
